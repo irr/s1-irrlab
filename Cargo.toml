@@ -1,0 +1,36 @@
+[package]
+name = "s1-irrlab"
+version = "0.1.0"
+edition = "2021"
+description = "Complexity-routing proxy: a System One decider picks the top or flash model for every OpenAI/Anthropic request"
+license = "MIT"
+publish = false
+
+[lib]
+name = "s1_irrlab"
+path = "src/lib.rs"
+
+[[bin]]
+name = "s1"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-stream = "0.3"
+axum = "0.8"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+eventsource-stream = "0.2"
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+wiremock = "0.6"
