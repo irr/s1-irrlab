@@ -5,7 +5,7 @@ use std::{sync::Arc, time::Instant};
 use axum::{
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, State},
-    http::{header, HeaderName, HeaderValue, StatusCode, Uri},
+    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -19,7 +19,7 @@ use crate::{
     decider::{Conversation, Decider, Decision},
     error::{upstream_message, ApiError, Protocol},
     openai,
-    upstream::{Tier, Upstream},
+    upstream::{MessagesHeaders, Tier, Upstream},
 };
 
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -104,7 +104,106 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: Bytes) -> Re
     stamp(response, &decision)
 }
 
-async fn messages(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+/// How a tier answered a Messages request.
+enum Answered {
+    /// Answered on `/messages`, as the client asked: the traffic there is
+    /// verbatim, the upstream already speaks Anthropic.
+    Native(reqwest::Response),
+    /// The tier does not serve Messages (404/405/501), so the request was
+    /// converted and answered on `/chat/completions`.
+    Chat(reqwest::Response, Value),
+}
+
+impl Answered {
+    fn status(&self) -> StatusCode {
+        match self {
+            Answered::Native(reply) | Answered::Chat(reply, _) => reply.status(),
+        }
+    }
+
+    /// Failures that say the model is unavailable, not that the request is
+    /// wrong: the other tier may well succeed.
+    fn failed(&self) -> Option<String> {
+        let status = self.status();
+        let unavailable =
+            status.is_server_error() || matches!(status.as_u16(), 401 | 403 | 404 | 408 | 429);
+        unavailable.then(|| format!("HTTP {status}"))
+    }
+}
+
+/// The outcome of one Messages attempt on one tier.
+enum TierReply {
+    Answered(Answered),
+    /// The HTTP call itself could not be made.
+    Dead(reqwest::Error),
+    /// The body could not be built if conversion becomes necessary; that is
+    /// the client's fault, but the native call never needed it.
+    Bad(String),
+}
+
+impl TierReply {
+    /// Whether the other tier is worth trying: the model is unavailable or
+    /// unreachable. A request the client got wrong fails everywhere.
+    fn failed(&self) -> Option<String> {
+        match self {
+            TierReply::Answered(answer) => answer.failed(),
+            TierReply::Dead(err) => Some(err.to_string()),
+            TierReply::Bad(_) => None,
+        }
+    }
+}
+
+/// Ask one tier, preferring the Messages API it was addressed on and
+/// transparently converting to chat-completions if it refuses the dialect.
+async fn ask_tier(
+    state: &AppState,
+    tier: Tier,
+    request: &Value,
+    dialect: &MessagesHeaders,
+) -> TierReply {
+    let upstream = state.upstream(tier);
+    let body = upstream.native_body(request);
+    match upstream.send_messages(&body, dialect).await {
+        Err(err) => TierReply::Dead(err),
+        Ok(reply) if !native_unsupported(reply.status()) => {
+            TierReply::Answered(Answered::Native(reply))
+        }
+        Ok(_) => {
+            // No Messages API here; fall back to the converted path.
+            let chat = match anthropic::request::to_chat(
+                request,
+                &upstream.model,
+                upstream.max_output_tokens,
+            ) {
+                Ok(chat) => chat,
+                Err(message) => return TierReply::Bad(message),
+            };
+            match upstream.send(&chat).await {
+                Ok(reply) => TierReply::Answered(Answered::Chat(reply, chat)),
+                Err(err) => TierReply::Dead(err),
+            }
+        }
+    }
+}
+
+/// Status codes that say the upstream does not serve Messages at all (as
+/// opposed to rejecting this particular request).
+fn native_unsupported(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 404 | 405 | 501)
+}
+
+/// Render an attempt outcome that did not produce an answer.
+fn fail_reply(protocol: Protocol, decision: &Decision, reply: TierReply) -> Response {
+    match reply {
+        TierReply::Dead(err) => bad_gateway(protocol, decision, err),
+        TierReply::Bad(message) => {
+            ApiError::new(protocol, StatusCode::BAD_REQUEST, message).into_response()
+        }
+        TierReply::Answered(_) => unreachable!("an answered attempt is not a failure"),
+    }
+}
+
+async fn messages(State(state): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
     let protocol = Protocol::Anthropic;
     let started = Instant::now();
     let request = match parse_object(protocol, &body) {
@@ -115,44 +214,84 @@ async fn messages(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
         Ok(decision) => decision,
         Err(err) => return err.into_response(),
     };
-    let build = |upstream: &Upstream| {
-        anthropic::request::to_chat(&request, &upstream.model, upstream.max_output_tokens)
+    let dialect = MessagesHeaders::extract(&headers);
+
+    let mut reply = ask_tier(&state, decision.tier, &request, &dialect).await;
+    if state.cfg.decider.on_error == OnError::Ha {
+        if let Some(reason) = reply.failed() {
+            let failed = decision.tier;
+            tracing::warn!(
+                failed = failed.as_str(),
+                failover = failed.other().as_str(),
+                %reason,
+                "model failed, failing over"
+            );
+            decision.tier = failed.other();
+            decision.failed_over_from = Some(failed);
+            reply = ask_tier(&state, decision.tier, &request, &dialect).await;
+        }
+    }
+    let answer = match reply {
+        TierReply::Answered(answer) => answer,
+        other => return fail_reply(protocol, &decision, other),
     };
-    let (reply, chat) = match dispatch(&state, protocol, &mut decision, &build).await {
-        Ok(sent) => sent,
-        Err(response) => return *response,
-    };
+
     let upstream = state.upstream(decision.tier);
-    let status = reply.status();
+    let status = answer.status();
     log(protocol, &decision, status, started);
 
     let response = if !status.is_success() {
-        let text = reply.text().await.unwrap_or_default();
-        ApiError::new(protocol, status, upstream_message(&text)).into_response()
-    } else if chat.get("stream").and_then(Value::as_bool) == Some(true) {
-        let events = anthropic::stream::translate(reply, upstream.model.clone());
-        (
-            [
-                (header::CONTENT_TYPE, "text/event-stream"),
-                (header::CACHE_CONTROL, "no-cache"),
-            ],
-            Body::from_stream(events),
-        )
-            .into_response()
-    } else {
-        match reply.json::<Value>().await {
-            Ok(completion) => {
-                Json(anthropic::response::from_chat(&completion, &upstream.model)).into_response()
+        // An error arrived in one dialect; hand it to the client in the shape
+        // the client expects.
+        match answer {
+            Answered::Native(reply) | Answered::Chat(reply, _) => {
+                let text = reply.text().await.unwrap_or_default();
+                ApiError::new(protocol, status, upstream_message(&text)).into_response()
             }
-            Err(err) => ApiError::new(
-                protocol,
-                StatusCode::BAD_GATEWAY,
-                format!(
-                    "{} tier returned an unreadable response: {err}",
-                    decision.tier.as_str()
-                ),
-            )
-            .into_response(),
+        }
+    } else {
+        match answer {
+            Answered::Native(reply) => {
+                // Verbatim Messages traffic.
+                let mut builder = Response::builder().status(status);
+                for (name, value) in reply.headers() {
+                    if !HOP_BY_HOP.contains(&name.as_str()) {
+                        builder = builder.header(name, value);
+                    }
+                }
+                builder
+                    .body(Body::from_stream(reply.bytes_stream()))
+                    .expect("upstream status and headers are valid")
+            }
+            Answered::Chat(reply, chat) => {
+                if chat.get("stream").and_then(Value::as_bool) == Some(true) {
+                    let events = anthropic::stream::translate(reply, upstream.model.clone());
+                    (
+                        [
+                            (header::CONTENT_TYPE, "text/event-stream"),
+                            (header::CACHE_CONTROL, "no-cache"),
+                        ],
+                        Body::from_stream(events),
+                    )
+                        .into_response()
+                } else {
+                    match reply.json::<Value>().await {
+                        Ok(completion) => {
+                            Json(anthropic::response::from_chat(&completion, &upstream.model))
+                                .into_response()
+                        }
+                        Err(err) => ApiError::new(
+                            protocol,
+                            StatusCode::BAD_GATEWAY,
+                            format!(
+                                "{} tier returned an unreadable response: {err}",
+                                decision.tier.as_str()
+                            ),
+                        )
+                        .into_response(),
+                    }
+                }
+            }
         }
     };
     stamp(response, &decision)
