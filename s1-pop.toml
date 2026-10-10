@@ -1,0 +1,31 @@
+# s1 — complexity-routing proxy. Copy to s1.toml and fill in both tiers.
+# Any string may reference the environment as {env:VAR_NAME}.
+
+[server]
+host = "0.0.0.0"   # the proxy injects upstream API keys, so keep it on loopback
+port = 1970
+
+# Most capable model: receives prompts the decider judges complex.
+[top]
+base_url = "https://openrouter.ai/api/v1"
+model    = "anthropic/claude-opus-5.5"
+api_key  = "{env:OPENROUTER_API_KEY}"
+timeout_secs      = 600                    # optional; omitted = wait forever
+max_output_tokens = 32768                  # optional; clamps the client's max_tokens
+
+# Light model: receives everything else.
+[flash]
+base_url = "http://192.168.1.209:8000/v1" # irrlab.ai NVIDIA DGX Spark vLLM
+model    = "Qwen/Qwen3.8-Flash-Next"
+max_output_tokens = 32768
+
+# System One decision model (clef-flash, Jev, ...) consulted before every routing choice.
+[decider]
+url = "http://127.0.0.1:8000/v1/decisions"
+model           = "clef-flash"
+# api_key         = "{env:JEV_API_KEY}"   # optional
+timeout_ms      = 3000
+threshold       = 0.5    # route to top when p(top) >= threshold
+on_error        = "ha"   # when the decider is unusable: top | flash | fail (503) | ha
+                         # ha = use top, and retry on the other tier if a model fails
+sticky_ttl_secs = 0      # reuse a decision across one user turn's tool loop; 0 = always ask, n = secs
